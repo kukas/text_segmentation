@@ -4,6 +4,11 @@ from collections import Counter
 from numba import njit, types
 from numba.typed import Dict
 import random
+import subprocess
+import re
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 
 @njit
@@ -111,7 +116,7 @@ class CRPTextSegmentation:
             # print(prev_sep, i, next_sep)
             # print(prev_word, joined_word, next_word)
 
-    def segmentation(self, text, numiter):
+    def segmentation(self, text, numiter, output_file=None, pre_step_callback=None):
         """Segment text into sentences using CRP."""
         n = len(text)
         C = len(set(text))
@@ -124,8 +129,46 @@ class CRPTextSegmentation:
         for k, v in counts.items():
             counts_typed[k] = v
 
+        results = []
+
         for it in range(numiter):
-            print("Iteration: ", it)
+            # print("Iteration: ", it)
+            logging.info("Iteration: %d", it)
+
+            if output_file is not None:
+                segmented_text = self._segment_text(text, s[1:])
+                segmented_text = " ".join(segmented_text)
+                output_file_formatted = output_file.format(it=it)
+                with open(output_file_formatted, "w+") as f:
+                    f.write(segmented_text)
+
+                # run perl script to evaluate segmentation
+                # extract precision, recall and F1 score from the stdout
+                process = subprocess.run(
+                    ["perl", "eval.pl", "data_small_gold.txt", output_file_formatted],
+                    capture_output=True,
+                )
+                stdout = process.stdout.decode("utf-8")
+
+                # parse out the precision, recall and F1 score from the stdout using regex
+                # format is: P:0.017, R:0.044, F:0.024
+                precision, recall, f1 = map(float, re.findall(r"\d+\.\d+", stdout))
+                # print(f"Precision: {precision}, Recall: {recall}, F1: {f1}")
+                # os.system(f"perl eval.pl data_small_gold.txt {output_file_formatted}")
+
+                result = {
+                    "iteration": it,
+                    "segmentation": segmented_text,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1,
+                }
+
+            if pre_step_callback is not None:
+                pre_step_callback(self, it, result)
+            # print(s, text, self._segment_text(text, s[1:]))
+            results.append(result)
+
             CRPTextSegmentation._step(
                 text,
                 s,
@@ -137,7 +180,8 @@ class CRPTextSegmentation:
                 self.p_c,
                 self.T,
             )
-            print(s, text, self._segment_text(text, s[1:]))
+
+        return results
 
 
 def test_compute_word_counts():
@@ -194,4 +238,4 @@ if __name__ == "__main__":
         text = f.read()
 
     crp = CRPTextSegmentation(100, 0.99, 0.5, 1)
-    crp.segmentation(text, 50)
+    crp.segmentation(text, 50, output_file="output_{it}.txt")
