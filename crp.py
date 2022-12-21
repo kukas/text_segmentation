@@ -1,6 +1,8 @@
 import numba
 import numpy as np
 from collections import Counter
+import time
+from tqdm import tqdm
 from numba import njit, types
 from numba.typed import Dict
 import random
@@ -8,14 +10,14 @@ import subprocess
 import re
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @njit
-def p_0(word, C, p_c):
+def compute_p_0(word_len, C, p_c):
     """Compute the base probability of a word."""
-    assert len(word) > 0, "Word must be non-empty."
-    return np.power(p_c / C, len(word)) * (1 - p_c)
+    # assert len(word) > 0, "Word must be non-empty."
+    return np.power(p_c / C, word_len) * (1 - p_c)
 
 
 @njit
@@ -64,7 +66,7 @@ class CRPTextSegmentation:
 
     @staticmethod
     @njit
-    def _step(text, s, counts, total, alpha, p_cont, C, p_c, T):
+    def _step(text, s, counts, total, alpha, p_cont, C, p_c, p_0, T):
         """Perform one step of CRP."""
         n = len(s)
         random_perm = np.random.permutation(np.arange(1, n))
@@ -76,48 +78,72 @@ class CRPTextSegmentation:
             next_sep = _get_adjacent_separator(s, i, 1)
             prev_word = text[prev_sep:i]
             next_word = text[i:next_sep]
-            joined_word = prev_word + next_word
+            joined_word = text[prev_sep:next_sep]
+
+            len_prev_word = i - prev_sep
+            len_next_word = next_sep - i
+            len_joined_word = next_sep - prev_sep
+            # assert len_prev_word == len(prev_word)
+            # assert len_next_word == len(next_word)
+            # assert len_joined_word == len(joined_word)
+
+            count_joined_word = counts.get(joined_word, 0)
+            count_prev_word = counts.get(prev_word, 0)
+            count_next_word = counts.get(next_word, 0)
 
             if s[i] == 0:
                 # Remove joined word
-                counts[joined_word] -= 1
+                assert count_joined_word > 0, "Joined word not in counts."
+                count_joined_word -= 1
                 total -= 1
             else:
                 # Remove separate words
-                counts[prev_word] -= 1
-                counts[next_word] -= 1
+                assert count_prev_word > 0, "Previous word not in counts."
+                assert count_next_word > 0, "Next word not in counts."
+                count_prev_word -= 1
+                count_next_word -= 1
                 total -= 2
 
             # Compute probabilities
-            p[0] = (alpha * p_0(joined_word, C, p_c) + counts.get(joined_word, 0)) / (
-                alpha + total
-            )
+            p[0] = (alpha * p_0[len_joined_word] + count_joined_word) / (alpha + total)
             p[1] = (
-                (alpha * p_0(prev_word, C, p_c) + counts.get(prev_word, 0))
-                * (alpha * p_0(next_word, C, p_c) + counts.get(next_word, 0))
+                (alpha * p_0[len_prev_word] + count_prev_word)
+                * (alpha * p_0[len_next_word] + count_next_word)
                 / (alpha + total)
                 / (alpha + total + 1)
                 * p_cont
             )
-            p = p / np.sum(p)
+            p = p / (p[0] + p[1])
+            if T != 1:
+                p = p ** (1 / T)
+                p = p / (p[0] + p[1])
+            old_s = s[i]
             s[i] = random.random() < p[1]
 
             if s[i] == 0:
-                # Add joined word to counts
-                counts[joined_word] = counts.get(joined_word, 0) + 1
+                # Add joined word to counts if it was split
+                if old_s == 1:
+                    counts[joined_word] = count_joined_word + 1
+                    counts[prev_word] = count_prev_word
+                    counts[next_word] = count_next_word
                 total += 1
             else:
-                # Add separate words to counts
-                counts[prev_word] = counts.get(prev_word, 0) + 1
-                counts[next_word] = counts.get(next_word, 0) + 1
+                # Add separate words to counts if they were joined
+                if old_s == 0:
+                    counts[joined_word] = count_joined_word
+                    counts[prev_word] = count_prev_word + 1
+                    counts[next_word] = count_next_word + 1
                 total += 2
 
-            # print(s, text)
-            # print(prev_sep, i, next_sep)
-            # print(prev_word, joined_word, next_word)
+        return total
+
+        # print(s, text)
+        # print(prev_sep, i, next_sep)
+        # print(prev_word, joined_word, next_word)
 
     def segmentation(self, text, numiter, output_file=None, pre_step_callback=None):
         """Segment text into sentences using CRP."""
+        start_time = time.time()
         n = len(text)
         C = len(set(text))
         # initialize random binary array s_i for storing segmentation
@@ -129,11 +155,20 @@ class CRPTextSegmentation:
         for k, v in counts.items():
             counts_typed[k] = v
 
+        # precompute p_0
+        p_0 = []
+        p_0.append(-1)
+        for i in range(1, 1000):
+            p_0.append(compute_p_0(i, C, self.p_c))
+        p_0 = np.array(p_0)
+
         results = []
 
-        for it in range(numiter):
+        pbar = tqdm(range(numiter))
+        for it in pbar:
             # print("Iteration: ", it)
-            logging.info("Iteration: %d", it)
+            logger.info("Iteration: %d, Time: %f s", it, time.time() - start_time)
+            start_time = time.time()
 
             if output_file is not None:
                 segmented_text = self._segment_text(text, s[1:])
@@ -153,8 +188,9 @@ class CRPTextSegmentation:
                 # parse out the precision, recall and F1 score from the stdout using regex
                 # format is: P:0.017, R:0.044, F:0.024
                 precision, recall, f1 = map(float, re.findall(r"\d+\.\d+", stdout))
-                # print(f"Precision: {precision}, Recall: {recall}, F1: {f1}")
                 # os.system(f"perl eval.pl data_small_gold.txt {output_file_formatted}")
+                logger.info("P: %f, R: %f, F: %f", precision, recall, f1)
+                pbar.set_postfix({"P": precision, "R": recall, "F": f1})
 
                 result = {
                     "iteration": it,
@@ -162,6 +198,9 @@ class CRPTextSegmentation:
                     "precision": precision,
                     "recall": recall,
                     "f1": f1,
+                    "p_c": self.p_c,
+                    "alpha": self.alpha,
+                    "T": self.T,
                 }
 
             if pre_step_callback is not None:
@@ -169,7 +208,7 @@ class CRPTextSegmentation:
             # print(s, text, self._segment_text(text, s[1:]))
             results.append(result)
 
-            CRPTextSegmentation._step(
+            total = CRPTextSegmentation._step(
                 text,
                 s,
                 counts_typed,
@@ -178,6 +217,7 @@ class CRPTextSegmentation:
                 self.p_cont,
                 C,
                 self.p_c,
+                p_0,
                 self.T,
             )
 
@@ -238,4 +278,4 @@ if __name__ == "__main__":
         text = f.read()
 
     crp = CRPTextSegmentation(100, 0.99, 0.5, 1)
-    crp.segmentation(text, 50, output_file="output_{it}.txt")
+    crp.segmentation(text, 20, output_file="output_{it}.txt")
