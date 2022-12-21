@@ -65,6 +65,16 @@ class CRPTextSegmentation:
         return counts, total
 
     @staticmethod
+    def precompute_p_0(C, p_c):
+        p_0 = []
+        p_0.append(-1)
+        for i in range(1, 1000):
+            p_0.append(compute_p_0(i, C, p_c))
+        p_0 = np.array(p_0)
+
+        return p_0
+
+    @staticmethod
     @njit
     def _step(text, s, counts, total, alpha, p_cont, C, p_c, p_0, T):
         """Perform one step of CRP."""
@@ -102,6 +112,11 @@ class CRPTextSegmentation:
                 assert count_next_word > 0, "Next word not in counts."
                 count_prev_word -= 1
                 count_next_word -= 1
+                # Gotcha! if the two words are the same
+                # we need to decrease the count by 2 for both
+                if prev_word == next_word:
+                    count_prev_word -= 1
+                    count_next_word -= 1
                 total -= 2
 
             # Compute probabilities
@@ -132,7 +147,7 @@ class CRPTextSegmentation:
                 if old_s == 0:
                     counts[joined_word] = count_joined_word
                     counts[prev_word] = count_prev_word + 1
-                    counts[next_word] = count_next_word + 1
+                    counts[next_word] = counts.get(next_word, 0) + 1
                 total += 2
 
         return total
@@ -156,11 +171,7 @@ class CRPTextSegmentation:
             counts_typed[k] = v
 
         # precompute p_0
-        p_0 = []
-        p_0.append(-1)
-        for i in range(1, 1000):
-            p_0.append(compute_p_0(i, C, self.p_c))
-        p_0 = np.array(p_0)
+        p_0 = CRPTextSegmentation.precompute_p_0(C, self.p_c)
 
         results = []
 
@@ -171,7 +182,7 @@ class CRPTextSegmentation:
             start_time = time.time()
 
             if output_file is not None:
-                segmented_text = self._segment_text(text, s[1:])
+                segmented_text = CRPTextSegmentation._segment_text(text, s[1:])
                 segmented_text = " ".join(segmented_text)
                 output_file_formatted = output_file.format(it=it)
                 with open(output_file_formatted, "w+") as f:
@@ -262,6 +273,8 @@ def test_compute_word_counts():
 
 def test_get_adjacent_separator():
     sep = np.array([0, 0, 1, 0, 0, 1, 0, 0])
+    assert _get_adjacent_separator(sep, 1, -1) == 0
+    assert _get_adjacent_separator(sep, 1, 1) == 2
     assert _get_adjacent_separator(sep, 3, 1) == 5
     assert _get_adjacent_separator(sep, 3, -1) == 2
     assert _get_adjacent_separator(sep, 2, -1) == 0
@@ -269,9 +282,59 @@ def test_get_adjacent_separator():
     assert _get_adjacent_separator(sep, 5, 1) == 8
 
 
+def test_step():
+    p_c = 0.5
+    alpha = 100
+    p_cont = 0.99
+    T = 1
+    numiter = 10
+
+    text = "aaaabbbbbccccdddd"
+    n = len(text)
+    C = len(set(text))
+    # initialize random binary array s_i for storing segmentation
+    s = np.random.randint(2, size=n)
+    counts, total = CRPTextSegmentation.compute_word_counts(text, s[1:])
+
+    p_0 = CRPTextSegmentation.precompute_p_0(C, p_c)
+
+    pbar = tqdm(range(numiter))
+    for it in pbar:
+        segmented_text = CRPTextSegmentation._segment_text(text, s[1:])
+        segmented_text = " ".join(segmented_text)
+        print(segmented_text)
+        print(counts, total)
+
+        # print("=== step begin ===")
+        total = CRPTextSegmentation._step(
+            text,
+            s,
+            counts,
+            total,
+            alpha,
+            p_cont,
+            C,
+            p_c,
+            p_0,
+            T,
+        )
+        # print("=== step end ===")
+        segmented_text = CRPTextSegmentation._segment_text(text, s[1:])
+        segmented_text = " ".join(segmented_text)
+        # print(segmented_text)
+        # print(counts, total)
+        check_counts, check_total = CRPTextSegmentation.compute_word_counts(text, s[1:])
+        assert total == check_total
+        for word, count in counts.items():
+            assert count == check_counts[word]
+        # print()
+        # assert (counts, total) == CRPTextSegmentation.compute_word_counts(text, s[1:])
+
+
 if __name__ == "__main__":
     test_compute_word_counts()
     test_get_adjacent_separator()
+    # test_step()
 
     # open data_small.txt
     with open("data_small.txt", "r") as f:
